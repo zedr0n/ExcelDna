@@ -117,6 +117,53 @@ namespace ExcelDna.Integration.Rtd
         IRTDUpdateEvent _callbackObject;
         readonly object _updateLock = new object();
 
+        /// <summary>
+        /// Performs a batch update of multiple topics, ensuring that all updates are visible to Excel at the same time.
+        /// </summary>
+        /// <param name="topics">List or array of topics to update</param>
+        /// <param name="values">List or array of values matching the topics</param>
+        public void UpdateValues(IList<Topic> topics, IList<object> values)
+        {
+            if (topics == null)
+                throw new ArgumentNullException("topics");
+            if (values == null)
+                throw new ArgumentNullException("values");
+            if (topics.Count != values.Count)
+                throw new ArgumentException("Number of values must match number of topics");
+
+            lock (_updateLock)
+            {
+                // Pretend that we've already notified, which will suppress the extra notification calls
+                var wasNotified = _notified;
+                _notified = true;
+                try
+                {
+                    for (int i = 0; i < topics.Count; i++)
+                    {
+                        var topic = topics[i];
+                        var value = values[i];
+                        // Call the real Topic.UpdateValue so that values get normalized and server notified
+                        topic.UpdateValue(value);
+                    }
+                }
+                finally
+                {
+                    if (!wasNotified && _dirtyTopics.Count > 0)
+                    {
+                        _updateSync.UpdateNotify(_callbackObject);
+                        // and leave _notified as true (which we've alread set above)
+                    }
+                    else
+                    {
+                        // else wasNotified is false, or there are no dirty topics
+                        // set _notified false so that next update will notify
+                        _notified = false;
+                    }
+                }
+            }
+            
+        }
+
         // The next few are the core RTD methods to be overridden by implementations
         protected virtual bool ServerStart()
         {
@@ -246,12 +293,27 @@ namespace ExcelDna.Integration.Rtd
                     // Not sure what to return here for error. We try the COM error version of #VALUE !?
                     return ExcelErrorUtil.ToComError(ExcelError.ExcelErrorValue);
                 }
-                _activeTopics[topicId] = topic;
+
+                // NOTE: 2016-11-04
+                //       Before v 0.34 the topic was added to _activeTopics before ConnectData was called
+                //       The effect of moving it after (hence that topic is not in _activeTopics during the ConnectData call)
+                //       is that a call to UpdateValue during the the ConnectData call will no longer cause an Update call to Excel
+                //       (since SetDirty is ignored for topics not in _activeTopics)
+                object value;
                 using (XlCall.Suspend())
                 {
-                    return ConnectData(topic, topicInfo, ref newValues);
+                    value = ConnectData(topic, topicInfo, ref newValues);
                 }
-                
+                _activeTopics[topicId] = topic;
+
+                // Now we need to ensure that the topic value does indeed agree with the returned value
+                // Otherwise we are left with an inconsistent state for future updates.
+                // If there's a difference, we do force the update.
+                if (!object.Equals(value, topic.Value))
+                {
+                    topic.UpdateNotify();
+                }
+                return value;
             }
             catch (Exception e)
             {
